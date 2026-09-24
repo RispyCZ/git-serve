@@ -122,6 +122,9 @@ pub struct Mirror {
     credentials: Option<Credentials>,
     ttl: Duration,
     git_timeout: Duration,
+    blobless: bool,
+    /// Serializes object fetches, so concurrent requests for the same files download them once.
+    object_fetch: tokio::sync::Mutex<()>,
     /// Set once the cache holds a repository: at startup, or by the worker after cloning.
     repo: OnceLock<ThreadSafeRepository>,
     schedule: Mutex<Schedule>,
@@ -161,6 +164,8 @@ impl Mirror {
             credentials,
             ttl: config.ttl,
             git_timeout: config.git_timeout,
+            blobless: config.blobless,
+            object_fetch: tokio::sync::Mutex::new(()),
             repo,
             schedule: Mutex::new(Schedule {
                 requested: 1,
@@ -302,15 +307,15 @@ impl Mirror {
         // `open` found the dir missing or empty, so anything in it now is left over from a
         // clone of ours that was killed.
         clear_dir(&self.dir)?;
-        tracing::info!(url = %self.url, dir = %self.dir.display(), "cloning");
-        self.run(
-            "clone",
-            self.git()
-                .args(["clone", "--bare", "--quiet", "--origin", REMOTE_NAME, "--"])
-                .arg(&self.url)
-                .arg(&self.dir),
-        )
-        .await?;
+        tracing::info!(url = %self.url, dir = %self.dir.display(), blobless = self.blobless, "cloning");
+        let mut clone = self.git();
+        clone.args(["clone", "--bare", "--quiet", "--origin", REMOTE_NAME]);
+        if self.blobless {
+            // Records the upstream as a promisor remote, so later fetches keep the filter.
+            clone.arg("--filter=blob:none");
+        }
+        self.run("clone", clone.arg("--").arg(&self.url).arg(&self.dir))
+            .await?;
         // `fetch.writeCommitGraph` covers later fetches but not the clone.
         if let Err(e) = self
             .run(
@@ -368,6 +373,46 @@ impl Mirror {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    /// Fetches objects a partial clone does not hold yet, such as file contents in blobless mode.
+    pub async fn fetch_objects(self: &Arc<Self>, ids: Vec<ObjectId>) -> Result<(), SyncError> {
+        let _guard = self.object_fetch.lock().await;
+        // Another request may have fetched them while this one waited.
+        let missing = self
+            .with_repo(move |repo| {
+                Ok(ids
+                    .into_iter()
+                    .filter(|id| !repo.has_object(id))
+                    .collect::<Vec<_>>())
+            })
+            .await?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        tracing::debug!(count = missing.len(), "fetching objects");
+        let input: String = missing.iter().map(|id| format!("{id}\n")).collect();
+        self.run_with_input(
+            "fetch <objects>",
+            self.git_dir()
+                .args([
+                    // Asking for known objects needs no negotiation, and they add no commits.
+                    "-c",
+                    "fetch.negotiationAlgorithm=noop",
+                    "-c",
+                    "fetch.writeCommitGraph=false",
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--recurse-submodules=no",
+                    "--stdin",
+                ])
+                .arg(REMOTE_NAME),
+            Some(input.into_bytes()),
+        )
+        .await?;
         Ok(())
     }
 
@@ -442,9 +487,28 @@ impl Mirror {
     /// Runs `cmd` to completion and returns its stdout. On timeout or shutdown its process group
     /// gets SIGTERM, so git removes its lockfiles, and SIGKILL if still running after `TERM_GRACE`.
     async fn run(&self, what: &str, cmd: &mut Command) -> Result<String, SyncError> {
-        let child = cmd
+        self.run_with_input(what, cmd, None).await
+    }
+
+    /// [`Mirror::run`] with `input` written to the process's stdin.
+    async fn run_with_input(
+        &self,
+        what: &str,
+        cmd: &mut Command,
+        input: Option<Vec<u8>>,
+    ) -> Result<String, SyncError> {
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| SyncError::Git(format!("cannot run git: {e}")))?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            // Written concurrently with reading the output; closing stdin ends git's input.
+            tokio::spawn(async move {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &input).await;
+            });
+        }
         let pid = child.id();
         let output = child.wait_with_output();
         tokio::pin!(output);

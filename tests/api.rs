@@ -676,3 +676,103 @@ async fn cached_full_commit_id_is_served_without_sync() {
     assert_eq!(get(&app, "/files/a.txt").await.1, b"2");
     assert!(get_json(&app, "/sync").await.1["error"].is_string());
 }
+
+impl Fixture {
+    /// Lets the upstream serve partial clones and single objects, as GitHub and GitLab do.
+    fn allow_partial_clone(&self) {
+        self.git(&["config", "uploadpack.allowFilter", "true"]);
+        self.git(&["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    }
+
+    fn blobless_config(&self) -> MirrorConfig {
+        let mut config = self.config();
+        config.blobless = true;
+        config
+    }
+
+    /// Objects the cache lacks, counted without fetching them.
+    fn missing_in_cache(&self) -> usize {
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.cache)
+            .args(["rev-list", "--objects", "--all", "--missing=print"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with('?'))
+            .count()
+    }
+}
+
+#[tokio::test]
+async fn blobless_mode_fetches_file_contents_when_first_read() {
+    let f = Fixture::new();
+    f.allow_partial_clone();
+    f.commit(
+        &[
+            ("README.md", "hello"),
+            ("src/a.rs", "aa"),
+            ("src/b.rs", "bbb"),
+        ],
+        "first",
+    );
+    let readme = f.git(&["rev-parse", "HEAD:README.md"]);
+    let app = start(f.blobless_config()).await;
+    assert_eq!(f.missing_in_cache(), 3);
+
+    // History, path filters and conditional requests need no file contents.
+    let (status, log) = get_json(&app, "/commits?path=src/a.rs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(log.as_array().unwrap().len(), 1);
+    let res = conditional_get(&app, "/files/README.md", Some(&format!("\"{readme}\""))).await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(f.missing_in_cache(), 3);
+
+    assert_eq!(get(&app, "/files/README.md").await.1, b"hello");
+    assert_eq!(f.missing_in_cache(), 2);
+
+    // A listing fetches the directory's files in one batch for their sizes.
+    let (status, src) = get_json(&app, "/tree/src").await;
+    assert_eq!(status, StatusCode::OK);
+    let sizes: Vec<u64> = src
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["size"].as_u64().unwrap())
+        .collect();
+    assert_eq!(sizes, [2, 3]);
+    assert_eq!(f.missing_in_cache(), 0);
+}
+
+#[tokio::test]
+async fn blobless_mode_stays_blobless_across_syncs() {
+    let f = Fixture::new();
+    f.allow_partial_clone();
+    f.commit(&[("a.txt", "1")], "first");
+    let app = start(f.blobless_config()).await;
+
+    f.commit(&[("a.txt", "2"), ("b.txt", "new")], "second");
+    assert_eq!(post(&app, "/sync").await.0, StatusCode::OK);
+    assert_eq!(f.missing_in_cache(), 3);
+    assert_eq!(get(&app, "/files/b.txt").await.1, b"new");
+    assert_eq!(f.missing_in_cache(), 2);
+}
+
+#[tokio::test]
+async fn blobless_mode_without_upstream_is_unavailable_for_missing_files() {
+    let f = Fixture::new();
+    f.allow_partial_clone();
+    f.commit(&[("a.txt", "1"), ("b.txt", "2")], "first");
+    let app = start(f.blobless_config()).await;
+    assert_eq!(get(&app, "/files/a.txt").await.1, b"1");
+
+    std::fs::remove_dir_all(&f.upstream).unwrap();
+    // Already fetched: still served.
+    assert_eq!(get(&app, "/files/a.txt").await.1, b"1");
+    let res = conditional_get(&app, "/files/b.txt", None).await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(res.headers().contains_key(header::RETRY_AFTER));
+}

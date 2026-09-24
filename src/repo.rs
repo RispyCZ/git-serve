@@ -134,27 +134,37 @@ pub fn read_tree(
         entry.object().map_err(AppError::internal)?.into_tree()
     };
 
-    tree.iter()
-        .map(|entry| {
-            let entry = entry.map_err(AppError::internal)?;
-            let kind = entry.mode().kind();
-            let size = match kind {
-                EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => Some(
-                    repo.find_header(entry.oid())
-                        .map_err(AppError::internal)?
-                        .size(),
-                ),
-                EntryKind::Tree | EntryKind::Commit => None,
-            };
-            Ok(TreeEntry {
-                name: entry.filename().to_str_lossy().into_owned(),
-                kind: entry_kind(kind),
-                mode: kind.as_octal_str().to_string(),
-                oid: entry.oid().to_string(),
-                size,
-            })
-        })
-        .collect()
+    // A partial clone may lack file contents, which hold the sizes: collect every missing one,
+    // so they are fetched in one batch.
+    let mut missing = Vec::new();
+    let mut entries = Vec::new();
+    for entry in tree.iter() {
+        let entry = entry.map_err(AppError::internal)?;
+        let kind = entry.mode().kind();
+        let size = match kind {
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                let header = repo
+                    .try_find_header(entry.oid())
+                    .map_err(AppError::internal)?;
+                if header.is_none() {
+                    missing.push(entry.object_id());
+                }
+                header.map(|h| h.size())
+            }
+            EntryKind::Tree | EntryKind::Commit => None,
+        };
+        entries.push(TreeEntry {
+            name: entry.filename().to_str_lossy().into_owned(),
+            kind: entry_kind(kind),
+            mode: kind.as_octal_str().to_string(),
+            oid: entry.oid().to_string(),
+            size,
+        });
+    }
+    if !missing.is_empty() {
+        return Err(AppError::MissingObjects(missing));
+    }
+    Ok(entries)
 }
 
 /// Returns the blob id of the file at `path`, so callers can answer conditional requests without reading it.
@@ -171,8 +181,12 @@ pub fn find_blob(repo: &Repository, commit: ObjectId, path: &str) -> Result<Obje
 }
 
 pub fn read_blob(repo: &Repository, id: ObjectId) -> Result<Vec<u8>, AppError> {
-    Ok(repo
-        .find_blob(id)
+    let object = repo
+        .try_find_object(id)
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::MissingObjects(vec![id]))?;
+    Ok(object
+        .try_into_blob()
         .map_err(AppError::internal)?
         .detach()
         .data)

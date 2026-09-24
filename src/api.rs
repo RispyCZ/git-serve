@@ -102,19 +102,37 @@ async fn sync(State(mirror): AppState) -> (StatusCode, Json<Status>) {
 }
 
 /// Runs blocking gix work off the async executor on a thread-local repository handle.
+///
+/// When `f` needs objects a partial clone has not fetched yet, they are fetched from the
+/// upstream and `f` runs once more.
 async fn with_repo<T, F>(mirror: Arc<Mirror>, f: F) -> Result<T, AppError>
 where
     T: Send + 'static,
-    F: FnOnce(&gix::Repository) -> Result<T, AppError> + Send + 'static,
+    F: Fn(&gix::Repository) -> Result<T, AppError> + Send + Sync + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        let repo = mirror.repo().ok_or_else(|| not_ready(&mirror))?;
-        let mut repo = repo.to_thread_local();
-        repo.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
-        f(&repo)
-    })
-    .await
-    .map_err(AppError::internal)?
+    let f = Arc::new(f);
+    let run = |f: Arc<F>| {
+        let mirror = Arc::clone(&mirror);
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let repo = mirror.repo().ok_or_else(|| not_ready(&mirror))?;
+                let mut repo = repo.to_thread_local();
+                repo.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
+                f(&repo)
+            })
+            .await
+            .map_err(AppError::internal)?
+        }
+    };
+    match run(Arc::clone(&f)).await {
+        Err(AppError::MissingObjects(ids)) => {
+            mirror.fetch_objects(ids).await.map_err(|e| {
+                AppError::Unavailable(format!("cannot fetch objects from the upstream: {e}"))
+            })?;
+            run(f).await
+        }
+        result => result,
+    }
 }
 
 /// Cache policy of a response, from how its revision was named.

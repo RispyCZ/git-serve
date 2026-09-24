@@ -20,6 +20,9 @@ pub struct MirrorConfig {
     pub ttl: Duration,
     /// Longest a single git process (clone, fetch, ...) may run before it is terminated.
     pub git_timeout: Duration,
+    /// Clone without file contents and fetch them from the upstream when first read.
+    /// Only affects a new clone; an existing cache keeps the mode it was cloned with.
+    pub blobless: bool,
 }
 
 impl MirrorConfig {
@@ -33,6 +36,7 @@ impl MirrorConfig {
             token_user: "x-access-token".to_owned(),
             ttl: Duration::from_secs(30),
             git_timeout: Duration::from_secs(600),
+            blobless: false,
         }
     }
 }
@@ -55,6 +59,13 @@ impl Config {
         }
         if let Some(timeout) = seconds("GIT_SERVE_GIT_TIMEOUT")? {
             mirror.git_timeout = timeout;
+        }
+        if let Ok(v) = std::env::var("GIT_SERVE_BLOBLESS") {
+            mirror.blobless = match v.as_str() {
+                "1" | "true" => true,
+                "0" | "false" | "" => false,
+                _ => return Err(format!("GIT_SERVE_BLOBLESS={v:?} must be true or false")),
+            };
         }
         let bind = match std::env::var("GIT_SERVE_BIND") {
             Ok(s) => s

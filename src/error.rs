@@ -15,6 +15,9 @@ pub enum AppError {
     Unavailable(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// Objects a partial clone has not fetched yet; `api::with_repo` fetches them and retries.
+    #[error("objects not in the cache: {0:?}")]
+    MissingObjects(Vec<gix::ObjectId>),
 }
 
 impl AppError {
@@ -36,8 +39,8 @@ impl IntoResponse for AppError {
                 )
                     .into_response();
             }
-            Self::Internal(msg) => {
-                tracing::error!("{msg}");
+            Self::Internal(_) | Self::MissingObjects(_) => {
+                tracing::error!("{self}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": "internal error" })),
