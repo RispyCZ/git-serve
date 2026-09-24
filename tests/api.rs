@@ -649,3 +649,30 @@ async fn refs_etag_changes_when_refs_move() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_ne!(header_of(&res, header::ETAG), etag);
 }
+
+#[tokio::test]
+async fn cached_full_commit_id_is_served_without_sync() {
+    let f = Fixture::new();
+    let first = f.commit(&[("a.txt", "1")], "first");
+    let mut config = f.config();
+    config.ttl = Duration::ZERO;
+    let app = start(config).await;
+
+    // Not in the cache yet: a sync fetches it first.
+    let second = f.commit(&[("a.txt", "2")], "second");
+    let (status, body) = get(&app, &format!("/files/a.txt?ref={second}")).await;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, b"2".as_slice()));
+
+    // With the upstream gone, any sync attempt would record an error.
+    std::fs::remove_dir_all(&f.upstream).unwrap();
+    for id in [&first, &second] {
+        let (status, body) = get(&app, &format!("/files/a.txt?ref={id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.is_empty());
+        assert!(get_json(&app, "/sync").await.1["error"].is_null());
+    }
+
+    // A branch name still syncs.
+    assert_eq!(get(&app, "/files/a.txt").await.1, b"2");
+    assert!(get_json(&app, "/sync").await.1["error"].is_string());
+}

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -37,10 +37,38 @@ pub fn router(mirror: Arc<Mirror>) -> Router {
 
 type AppState = State<Arc<Mirror>>;
 
-/// Brings the cache up to date with the upstream first when the last sync is older than the TTL.
+/// Brings the cache up to date with the upstream first when the last sync is older than the TTL,
+/// unless the request names an object the cache already has: that answer cannot change.
 async fn ensure_fresh(State(mirror): AppState, req: Request, next: Next) -> Response {
-    mirror.ensure_fresh(false).await;
+    if !has_requested_object(&mirror, req.uri()).await {
+        mirror.ensure_fresh(false).await;
+    }
     next.run(req).await
+}
+
+/// Whether `?ref=` is a full object id present in the cache.
+async fn has_requested_object(mirror: &Arc<Mirror>, uri: &Uri) -> bool {
+    let Some(rev) = Query::<RevQuery>::try_from_uri(uri)
+        .ok()
+        .and_then(|Query(q)| q.rev)
+    else {
+        return false;
+    };
+    if Caching::for_rev(&rev) != Caching::Immutable {
+        return false;
+    }
+    let Ok(id) = gix::ObjectId::from_hex(rev.as_bytes()) else {
+        return false;
+    };
+    let mirror = Arc::clone(mirror);
+    // A miss rescans the pack directory, so keep it off the async executor.
+    tokio::task::spawn_blocking(move || {
+        mirror
+            .repo()
+            .is_some_and(|r| r.to_thread_local().has_object(id))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn not_ready(mirror: &Mirror) -> AppError {
@@ -90,7 +118,7 @@ where
 }
 
 /// Cache policy of a response, from how its revision was named.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Caching {
     /// Named by full object id: the answer can never change.
     Immutable,
