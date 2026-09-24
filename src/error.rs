@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
@@ -11,6 +11,8 @@ pub enum AppError {
     PathNotFound(String),
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -26,6 +28,14 @@ impl IntoResponse for AppError {
         let status = match &self {
             Self::RefNotFound(_) | Self::PathNotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unavailable(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "5")],
+                    Json(json!({ "error": self.to_string() })),
+                )
+                    .into_response();
+            }
             Self::Internal(msg) => {
                 tracing::error!("{msg}");
                 return (

@@ -1,39 +1,86 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use gix::ThreadSafeRepository;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::error::AppError;
+use crate::mirror::{Mirror, Status};
 use crate::repo::{self, CommitInfo, Refs, TreeEntry};
 
 const DEFAULT_LOG_LIMIT: usize = 50;
 const MAX_LOG_LIMIT: usize = 500;
 const OBJECT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
-pub fn router(repo: ThreadSafeRepository) -> Router {
-    Router::new()
+pub fn router(mirror: Arc<Mirror>) -> Router {
+    let content = Router::new()
         .route("/refs", get(refs))
         .route("/tree", get(tree_root))
         .route("/tree/{*path}", get(tree))
         .route("/files/{*path}", get(file))
         .route("/commits", get(commits))
-        .with_state(Arc::new(repo))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&mirror),
+            ensure_fresh,
+        ));
+    Router::new()
+        .merge(content)
+        .route("/healthz", get(healthz))
+        .route("/sync", get(sync_status).post(sync))
+        .with_state(mirror)
 }
 
-type AppState = State<Arc<ThreadSafeRepository>>;
+type AppState = State<Arc<Mirror>>;
+
+/// Brings the cache up to date with the upstream first when the last sync is older than the TTL.
+async fn ensure_fresh(State(mirror): AppState, req: Request, next: Next) -> Response {
+    mirror.ensure_fresh(false).await;
+    next.run(req).await
+}
+
+fn not_ready(mirror: &Mirror) -> AppError {
+    AppError::Unavailable(match mirror.status().error {
+        Some(e) => format!("repository is not available: {e}"),
+        None => "repository is being cloned".to_owned(),
+    })
+}
+
+/// Ready once the cache holds a repository, which may be older than the upstream.
+async fn healthz(State(mirror): AppState) -> Result<Json<serde_json::Value>, AppError> {
+    match mirror.repo() {
+        Some(_) => Ok(Json(json!({ "status": "ok" }))),
+        None => Err(not_ready(&mirror)),
+    }
+}
+
+async fn sync_status(State(mirror): AppState) -> Json<Status> {
+    Json(mirror.status())
+}
+
+/// Syncs with the upstream now, e.g. from a push webhook, and answers with the outcome.
+async fn sync(State(mirror): AppState) -> (StatusCode, Json<Status>) {
+    let status = mirror.ensure_fresh(true).await;
+    let code = if status.error.is_some() {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::OK
+    };
+    (code, Json(status))
+}
 
 /// Runs blocking gix work off the async executor on a thread-local repository handle.
-async fn with_repo<T, F>(repo: Arc<ThreadSafeRepository>, f: F) -> Result<T, AppError>
+async fn with_repo<T, F>(mirror: Arc<Mirror>, f: F) -> Result<T, AppError>
 where
     T: Send + 'static,
     F: FnOnce(&gix::Repository) -> Result<T, AppError> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
+        let repo = mirror.repo().ok_or_else(|| not_ready(&mirror))?;
         let mut repo = repo.to_thread_local();
         repo.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
         f(&repo)

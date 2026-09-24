@@ -1,6 +1,7 @@
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use git_serve::{api, config::Config, repo};
+use git_serve::{api, config::Config, mirror::Mirror};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -20,15 +21,39 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    let (url, dir) = (config.repo_url.clone(), config.cache_dir.clone());
-    let repo = tokio::task::spawn_blocking(move || repo::sync(&url, &dir)).await??;
+    let mirror = Arc::new(tokio::task::spawn_blocking(move || Mirror::open(config.mirror)).await??);
+    // The first sync starts now and overlaps with binding; requests wait for it.
+    let worker = mirror.spawn();
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(addr = %config.bind, "listening");
-    axum::serve(listener, api::router(repo))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+    let signalled = Arc::clone(&mirror);
+    axum::serve(listener, api::router(Arc::clone(&mirror)))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            tracing::info!("shutting down");
+            // Interrupts a running sync so requests waiting for it finish.
+            signalled.shutdown();
         })
         .await?;
+    mirror.shutdown();
+    worker.await?;
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM from the platform stopping the sandbox.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot listen for SIGTERM");
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
 }
