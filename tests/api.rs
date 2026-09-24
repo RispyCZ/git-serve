@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use git_serve::api;
 use git_serve::config::MirrorConfig;
 use git_serve::mirror::{Mirror, SyncError};
@@ -550,4 +550,102 @@ async fn hung_upstream_times_out() {
     assert_eq!(status.error.as_deref(), Some("git clone timed out"));
     // Well under the SIGTERM grace period: the transport helper was signalled along with git.
     assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+async fn conditional_get(app: &axum::Router, uri: &str, etag: Option<&str>) -> Response {
+    let mut req = Request::get(uri);
+    if let Some(etag) = etag {
+        req = req.header(header::IF_NONE_MATCH, etag);
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn header_of(res: &Response, name: header::HeaderName) -> &str {
+    res.headers().get(name).map_or("", |v| v.to_str().unwrap())
+}
+
+#[tokio::test]
+async fn full_commit_id_responses_are_immutable() {
+    let f = Fixture::new();
+    let commit = f.commit(&[("src/a.txt", "1")], "first");
+    let blob = f.git(&["rev-parse", "HEAD:src/a.txt"]);
+    let app = f.router().await;
+
+    for (uri, etag) in [
+        (format!("/tree?ref={commit}"), &commit),
+        (format!("/tree/src?ref={commit}"), &commit),
+        (format!("/commits?ref={commit}"), &commit),
+        (format!("/files/src/a.txt?ref={commit}"), &blob),
+    ] {
+        let res = conditional_get(&app, &uri, None).await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            header_of(&res, header::ETAG),
+            format!("\"{etag}\""),
+            "{uri}"
+        );
+        assert_eq!(
+            header_of(&res, header::CACHE_CONTROL),
+            "public, max-age=31536000, immutable",
+            "{uri}"
+        );
+    }
+
+    // A commit this cache does not have yet may arrive with the next sync.
+    let missing = "0".repeat(40);
+    let res = conditional_get(&app, &format!("/tree?ref={missing}"), None).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert!(res.headers().get(header::CACHE_CONTROL).is_none());
+}
+
+#[tokio::test]
+async fn ref_named_responses_revalidate_by_commit() {
+    let f = Fixture::new();
+    let first = f.commit(&[("a.txt", "1")], "first");
+    let app = f.router().await;
+
+    for uri in [
+        "/tree",
+        "/commits?limit=5",
+        &format!("/tree?ref={}", &first[..7]),
+    ] {
+        let res = conditional_get(&app, uri, None).await;
+        assert_eq!(header_of(&res, header::CACHE_CONTROL), "no-cache", "{uri}");
+        let etag = format!("\"{first}\"");
+        assert_eq!(header_of(&res, header::ETAG), etag, "{uri}");
+
+        let res = conditional_get(&app, uri, Some(&format!("\"other\", W/{etag}"))).await;
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED, "{uri}");
+        assert_eq!(header_of(&res, header::ETAG), etag, "{uri}");
+        assert_eq!(header_of(&res, header::CACHE_CONTROL), "no-cache", "{uri}");
+    }
+
+    let second = f.commit(&[("a.txt", "2")], "second");
+    assert_eq!(post(&app, "/sync").await.0, StatusCode::OK);
+    let res = conditional_get(&app, "/tree", Some(&format!("\"{first}\""))).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(header_of(&res, header::ETAG), format!("\"{second}\""));
+}
+
+#[tokio::test]
+async fn refs_etag_changes_when_refs_move() {
+    let f = Fixture::new();
+    f.commit(&[("a.txt", "1")], "first");
+    let app = f.router().await;
+
+    let res = conditional_get(&app, "/refs", None).await;
+    assert_eq!(header_of(&res, header::CONTENT_TYPE), "application/json");
+    assert_eq!(header_of(&res, header::CACHE_CONTROL), "no-cache");
+    let etag = header_of(&res, header::ETAG).to_owned();
+    let res = conditional_get(&app, "/refs", Some(&etag)).await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+
+    f.git(&["tag", "v2"]);
+    assert_eq!(post(&app, "/sync").await.0, StatusCode::OK);
+    let res = conditional_get(&app, "/refs", Some(&etag)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_ne!(header_of(&res, header::ETAG), etag);
 }

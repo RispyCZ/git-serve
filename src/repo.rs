@@ -80,14 +80,24 @@ pub fn list_refs(repo: &Repository) -> Result<Refs, AppError> {
     })
 }
 
-fn resolve_commit<'r>(repo: &'r Repository, rev: &str) -> Result<gix::Commit<'r>, AppError> {
+/// The commit `rev` names, peeling tags.
+pub fn resolve_commit(repo: &Repository, rev: &str) -> Result<ObjectId, AppError> {
     let not_found = || AppError::RefNotFound(rev.to_owned());
-    repo.rev_parse_single(rev.as_bytes().as_bstr())
+    Ok(repo
+        .rev_parse_single(rev.as_bytes().as_bstr())
         .map_err(|_| not_found())?
         .object()
         .map_err(AppError::internal)?
         .peel_to_commit()
-        .map_err(|_| not_found())
+        .map_err(|_| not_found())?
+        .id)
+}
+
+fn root_tree(repo: &Repository, commit: ObjectId) -> Result<gix::Tree<'_>, AppError> {
+    repo.find_commit(commit)
+        .map_err(AppError::internal)?
+        .tree()
+        .map_err(AppError::internal)
 }
 
 fn normalize(path: &str) -> &str {
@@ -103,12 +113,14 @@ fn entry_kind(kind: EntryKind) -> Kind {
     }
 }
 
-/// Lists the directory at `path` (empty for the root) in the commit `rev` resolves to.
-pub fn read_tree(repo: &Repository, rev: &str, path: &str) -> Result<Vec<TreeEntry>, AppError> {
+/// Lists the directory at `path` (empty for the root) in `commit`.
+pub fn read_tree(
+    repo: &Repository,
+    commit: ObjectId,
+    path: &str,
+) -> Result<Vec<TreeEntry>, AppError> {
     let path = normalize(path);
-    let root = resolve_commit(repo, rev)?
-        .tree()
-        .map_err(AppError::internal)?;
+    let root = root_tree(repo, commit)?;
     let tree = if path.is_empty() {
         root
     } else {
@@ -146,11 +158,9 @@ pub fn read_tree(repo: &Repository, rev: &str, path: &str) -> Result<Vec<TreeEnt
 }
 
 /// Returns the blob id of the file at `path`, so callers can answer conditional requests without reading it.
-pub fn find_blob(repo: &Repository, rev: &str, path: &str) -> Result<ObjectId, AppError> {
+pub fn find_blob(repo: &Repository, commit: ObjectId, path: &str) -> Result<ObjectId, AppError> {
     let path = normalize(path);
-    let entry = resolve_commit(repo, rev)?
-        .tree()
-        .map_err(AppError::internal)?
+    let entry = root_tree(repo, commit)?
         .lookup_entry_by_path(path)
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::PathNotFound(path.to_owned()))?;
@@ -179,16 +189,15 @@ fn signature(sig: gix::actor::SignatureRef<'_>) -> Signature {
     }
 }
 
-/// Walks history from `rev` newest first. With `path`, keeps only commits whose entry at `path`
+/// Walks history from `start` newest first. With `path`, keeps only commits whose entry at `path`
 /// differs from every parent's. Like `git log -- <path>`, a merge that took the entry unchanged
 /// from one side is not listed.
 pub fn log(
     repo: &Repository,
-    rev: &str,
+    start: ObjectId,
     path: Option<&str>,
     limit: usize,
 ) -> Result<Vec<CommitInfo>, AppError> {
-    let start = resolve_commit(repo, rev)?.id;
     let path = path.map(normalize).filter(|p| !p.is_empty());
     let walk = repo
         .rev_walk([start])
