@@ -3,6 +3,14 @@ name = "git-serve"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "git-serve"
+path = "src/main.rs"
+bench = false
+# main.rs only delegates to the library and has no tests of its own. Avoid
+# linking a second copy of the application as an empty test harness.
+test = false
+
 [dependencies]
 axum = "0.8.9"
 gix = { version = "0.87.1", default-features = false, features = ["revision", "max-performance-safe", "sha1"] }
