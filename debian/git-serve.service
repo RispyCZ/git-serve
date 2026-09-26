@@ -1,0 +1,19 @@
+[Unit]
+Description=git-serve HTTP server for a mirrored git repository
+Documentation=https://github.com/RispyCZ/git-serve
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/git-serve
+Environment=GIT_SERVE_CACHE_DIR=/var/lib/git-serve
+ExecStart=/usr/bin/git-serve
+Restart=on-failure
+DynamicUser=yes
+StateDirectory=git-serve
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

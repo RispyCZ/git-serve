@@ -2,6 +2,21 @@
 name = "git-serve"
 version = "0.1.0"
 edition = "2024"
+description = "HTTP server for files in a mirrored git repository"
+license = "MIT"
+repository = "https://github.com/RispyCZ/git-serve"
+
+[package.metadata.deb]
+maintainer = "Petr Václavek <petr@vaclavek.cloud>"
+section = "net"
+depends = "$auto, git"
+maintainer-scripts = "debian/"
+# Not started on install: GIT_SERVE_REPO_URL has to be configured first.
+systemd-units = { enable = false, start = false }
+assets = [
+    ["target/release/git-serve", "usr/bin/", "755"],
+    ["debian/git-serve.default", "etc/default/git-serve", "600"],
+]
 
 [[bin]]
 name = "git-serve"

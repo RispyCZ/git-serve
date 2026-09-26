@@ -1,0 +1,21 @@
+# Configuration for the git-serve systemd service.
+# Apply changes with: systemctl restart git-serve
+
+# Upstream repository to mirror (required).
+#GIT_SERVE_REPO_URL=https://github.com/owner/repo.git
+
+# HTTP password/token for the upstream and the username sent with it.
+#GIT_SERVE_TOKEN=
+#GIT_SERVE_TOKEN_USER=x-access-token
+
+# Address to listen on.
+GIT_SERVE_BIND=0.0.0.0:8080
+
+# Seconds a sync result is reused before asking the upstream again.
+#GIT_SERVE_SYNC_TTL=30
+
+# Longest a single git process may run, in seconds.
+#GIT_SERVE_GIT_TIMEOUT=600
+
+# Clone without file contents and fetch them on first read.
+GIT_SERVE_BLOBLESS=true

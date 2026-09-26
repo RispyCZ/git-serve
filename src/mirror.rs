@@ -309,7 +309,11 @@ impl Mirror {
         clear_dir(&self.dir)?;
         tracing::info!(url = %self.url, dir = %self.dir.display(), blobless = self.blobless, "cloning");
         let mut clone = self.git();
-        clone.args(["clone", "--bare", "--quiet", "--origin", REMOTE_NAME]);
+        // Config instead of `--origin`: older git (2.34 on Ubuntu 22.04) rejects it with `--bare`.
+        clone
+            .arg("-c")
+            .arg(format!("clone.defaultRemoteName={REMOTE_NAME}"))
+            .args(["clone", "--bare", "--quiet"]);
         if self.blobless {
             // Records the upstream as a promisor remote, so later fetches keep the filter.
             clone.arg("--filter=blob:none");
