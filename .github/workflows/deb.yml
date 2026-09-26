@@ -1,0 +1,66 @@
+name: deb
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    # Build against the oldest supported glibc so the binary runs on Debian 12+ and Ubuntu 22.04+.
+    container: docker.io/library/rust:1.98.0-bookworm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"name":"git-serve","version":"\([^"]*\)".*/\1/p')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Cargo.toml v$version"; exit 1; }
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo install cargo-deb --locked
+
+      - run: cargo deb --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.runner }}
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+
+      - name: Attach to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes *.deb
+
+      - name: Push to Cloudsmith
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+          # "<owner>/<repository>" on Cloudsmith.
+          CLOUDSMITH_REPO: ${{ vars.CLOUDSMITH_REPO }}
+        run: |
+          pipx install cloudsmith-cli
+          for deb in *.deb; do
+            cloudsmith push deb "$CLOUDSMITH_REPO/any-distro/any-version" "$deb"
+          done
