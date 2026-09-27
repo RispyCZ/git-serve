@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gix::bstr::ByteSlice;
 use gix::{ObjectId, ThreadSafeRepository};
@@ -504,6 +504,7 @@ impl Mirror {
         if input.is_some() {
             cmd.stdin(Stdio::piped());
         }
+        let started = Instant::now();
         let mut child = cmd
             .spawn()
             .map_err(|e| SyncError::Git(format!("cannot run git: {e}")))?;
@@ -519,6 +520,8 @@ impl Mirror {
         let reason = tokio::select! {
             out = &mut output => {
                 let out = out.map_err(|e| SyncError::Git(format!("git {what}: {e}")))?;
+                let elapsed_ms = started.elapsed().as_millis();
+                tracing::debug!(what, elapsed_ms, success = out.status.success(), "git exited");
                 if !out.status.success() {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     return Err(SyncError::Git(format!("git {what}: {}", stderr.trim())));
