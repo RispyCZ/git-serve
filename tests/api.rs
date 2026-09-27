@@ -325,6 +325,27 @@ async fn commits_filter_by_path_and_limit() {
 }
 
 #[tokio::test]
+async fn commits_path_filter_works_without_commit_graph() {
+    let f = Fixture::new();
+    let c1 = f.commit(&[("a.txt", "1"), ("b.txt", "1")], "one");
+    f.commit(&[("b.txt", "2")], "two");
+    let c3 = f.commit(&[("a.txt", "3")], "three");
+    let app = f.router().await;
+    let info = f.cache.join("objects/info");
+    let _ = std::fs::remove_file(info.join("commit-graph"));
+    let _ = std::fs::remove_dir_all(info.join("commit-graphs"));
+
+    let (_, log) = get_json(&app, "/commits?path=a.txt").await;
+    let ids: Vec<&str> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [c3.as_str(), c1.as_str()]);
+}
+
+#[tokio::test]
 async fn commits_path_filter_skips_merge_that_took_one_side() {
     let f = Fixture::new();
     let base = f.commit(&[("a.txt", "1"), ("b.txt", "1")], "base");
