@@ -221,6 +221,12 @@ pub fn log(
         .all()
         .map_err(AppError::internal)?;
 
+    // A path filter may walk the whole history. Decoding each commit only for its tree id dominates
+    // that walk, and the commit-graph stores the id; commits written after it are decoded.
+    let graph = match path {
+        Some(_) => repo.commit_graph_if_enabled().map_err(AppError::internal)?,
+        None => None,
+    };
     // Every commit is visited once as itself and once as a parent, so memoize the path lookup.
     let mut entry_at: HashMap<ObjectId, Option<ObjectId>> = HashMap::new();
     let mut lookup = |id: ObjectId| -> Result<Option<ObjectId>, AppError> {
@@ -228,10 +234,17 @@ pub fn log(
         if let Some(found) = entry_at.get(&id) {
             return Ok(*found);
         }
+        let tree = match graph.as_ref().and_then(|g| g.commit_by_id(id)) {
+            Some(c) => c.root_tree_id().to_owned(),
+            None => repo
+                .find_commit(id)
+                .map_err(AppError::internal)?
+                .tree_id()
+                .map_err(AppError::internal)?
+                .detach(),
+        };
         let found = repo
-            .find_commit(id)
-            .map_err(AppError::internal)?
-            .tree()
+            .find_tree(tree)
             .map_err(AppError::internal)?
             .lookup_entry_by_path(path)
             .map_err(AppError::internal)?
